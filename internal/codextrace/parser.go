@@ -4,11 +4,40 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/BurntSushi/toml"
+
 	"github.com/kirilligum/codex-langfuse-tracer/internal/agenttrace"
 )
+
+// codexConfigModel reads the top-level `model` key from Codex's config.toml.
+// TUI / interactive rollouts leave session_meta.model empty (it is only set
+// in non-interactive mode), so the model name falls back to the configured
+// default — the same value Codex actually used for every turn.
+func codexConfigModel() string {
+	dir := os.Getenv("CODEX_HOME")
+	if dir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return ""
+		}
+		dir = filepath.Join(home, ".codex")
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "config.toml"))
+	if err != nil {
+		return ""
+	}
+	var cfg struct {
+		Model string `toml:"model"`
+	}
+	if err := toml.Unmarshal(raw, &cfg); err != nil {
+		return ""
+	}
+	return cfg.Model
+}
 
 func ParseTurns(path string) ([]agenttrace.Turn, error) {
 	raw, err := os.ReadFile(path)
@@ -112,6 +141,13 @@ func ParseTurns(path string) ([]agenttrace.Turn, error) {
 	for _, turnID := range turnOrder {
 		turns = append(turns, *turnsByID[turnID])
 	}
+	if configModel := codexConfigModel(); configModel != "" {
+		for i := range turns {
+			if turns[i].Model == "" {
+				turns[i].Model = configModel
+			}
+		}
+	}
 	return turns, nil
 }
 
@@ -130,6 +166,14 @@ func parseEventMessage(turn *agenttrace.Turn, payload map[string]any, timestamp 
 			turn.EndTS = timestamp
 		}
 		turn.Completed = true
+		// Fallback for TUI / interactive rollouts where the assistant
+		// message path above found no text: task_complete carries the
+		// final answer in last_agent_message.
+		if len(turn.AssistantTexts) == 0 {
+			if message := agenttrace.StringValue(payload["last_agent_message"]); message != "" {
+				turn.AssistantTexts = []string{message}
+			}
+		}
 	case "exec_command_end":
 		callID := agenttrace.StringValue(payload["call_id"])
 		if callID != "" {
@@ -208,7 +252,12 @@ func parseResponseItem(turn *agenttrace.Turn, payload map[string]any, timestamp 
 				turn.UserMessages = []string{message}
 			}
 		case "assistant":
-			if agenttrace.StringValue(payload["phase"]) == "final_answer" {
+			// TUI / interactive rollouts omit `phase` on assistant messages
+			// (it is only set to "final_answer" in non-interactive mode), so
+			// accept a missing phase. The last assistant message in a turn is
+			// the final answer; assignments replace, so later messages win.
+			phase := agenttrace.StringValue(payload["phase"])
+			if phase == "final_answer" || phase == "" {
 				if message := textFromContent(payload["content"], "output_text"); message != "" {
 					turn.AssistantTexts = []string{message}
 				}
