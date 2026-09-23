@@ -2,6 +2,7 @@ package watch
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -32,7 +33,7 @@ type ScanOptions struct {
 	InitialLookbackSecs int
 }
 
-func InitializeState(statePath string, now time.Time, stdout io.Writer, quiet bool) (exportstate.State, error) {
+func InitializeState(ctx context.Context, statePath string, now time.Time, stdout io.Writer, quiet bool) (exportstate.State, bool, error) {
 	if now.IsZero() {
 		now = time.Now()
 	}
@@ -40,13 +41,14 @@ func InitializeState(statePath string, now time.Time, stdout io.Writer, quiet bo
 		Version:         exportstate.Version,
 		ScanWatermarkNS: now.Add(-time.Duration(buildinfo.DefaultInitialLookbackSecs) * time.Second).UnixNano(),
 	}
-	if err := exportstate.Save(statePath, state); err != nil {
-		return exportstate.State{}, err
+	state, created, err := exportstate.LoadOrCreate(ctx, statePath, state)
+	if err != nil {
+		return exportstate.State{}, false, err
 	}
-	if !quiet {
+	if created && !quiet {
 		fmt.Fprintln(writerOrDiscard(stdout), "initialized watch state; historical turns before the initial watermark will not be exported")
 	}
-	return state, nil
+	return state, created, nil
 }
 
 func ScanOnce(ctx context.Context, opts ScanOptions, state exportstate.State) (exportstate.State, int, error) {
@@ -57,7 +59,7 @@ func ScanOnce(ctx context.Context, opts ScanOptions, state exportstate.State) (e
 	scanStartedNS := opts.Now.UnixNano()
 	watermark := state.ScanWatermarkNS
 	exportedCount := 0
-	exportFailed := false
+	scanFailed := false
 	attemptedExport := false
 
 	var queueExported int
@@ -67,6 +69,10 @@ func ScanOnce(ctx context.Context, opts ScanOptions, state exportstate.State) (e
 		return state, queueExported, err
 	}
 	exportedCount += queueExported
+	processedTraceIDs := make(map[string]struct{}, len(state.ProcessedTraceIDs))
+	for _, traceID := range state.ProcessedTraceIDs {
+		processedTraceIDs[traceID] = struct{}{}
+	}
 
 	for _, sessionPath := range codextrace.SessionPaths(opts.Root) {
 		info, err := os.Stat(sessionPath)
@@ -81,15 +87,19 @@ func ScanOnce(ctx context.Context, opts ScanOptions, state exportstate.State) (e
 			continue
 		}
 
-		turns, err := codextrace.ParseTurns(sessionPath)
+		turns, err := codextrace.ParseTurnsFiltered(sessionPath, func(traceID string) bool {
+			_, processed := processedTraceIDs[traceID]
+			return !processed
+		})
 		if err != nil {
+			scanFailed = true
 			if !opts.Quiet {
 				fmt.Fprintf(stderr, "warning: skipped unreadable rollout %s: %v\n", sessionPath, err)
 			}
 			continue
 		}
 		for _, turn := range turns {
-			if state.HasProcessed(turn.TraceID) {
+			if _, processed := processedTraceIDs[turn.TraceID]; processed {
 				continue
 			}
 			var emitted int
@@ -99,12 +109,15 @@ func ScanOnce(ctx context.Context, opts ScanOptions, state exportstate.State) (e
 				return state, exportedCount + emitted, err
 			}
 			exportedCount += emitted
-			exportFailed = exportFailed || failed
+			scanFailed = scanFailed || failed
+			if state.HasProcessed(turn.TraceID) {
+				processedTraceIDs[turn.TraceID] = struct{}{}
+			}
 		}
 	}
 
-	if !exportFailed {
-		state, err = mutateState(opts.StatePath, state, func(current *exportstate.State) {
+	if !scanFailed {
+		state, err = mutateState(ctx, opts, state, func(current *exportstate.State) {
 			current.ScanWatermarkNS = scanStartedNS
 		})
 		if err != nil {
@@ -152,10 +165,14 @@ func processTurn(ctx context.Context, opts ScanOptions, state exportstate.State,
 			fmt.Fprintf(writerOrDiscard(opts.Stderr), "ERROR: failed to export trace=%s path=%s: %v\n", traceID, sourcePath, err)
 			return state, 0, true, nil
 		}
-		state, err = mutateState(opts.StatePath, state, func(current *exportstate.State) {
+		if !opts.Quiet {
+			fmt.Fprintf(writerOrDiscard(opts.Stdout), "span_export_succeeded trace=%s status=%d checkpoint=pending\n", traceID, status)
+		}
+		state, err = mutateState(ctx, opts, state, func(current *exportstate.State) {
 			current.SetPendingScore(traceID, environment)
 		})
 		if err != nil {
+			fmt.Fprintf(writerOrDiscard(opts.Stderr), "ERROR: span_checkpoint_unconfirmed trace=%s export_result=success replay_possible=true\n", traceID)
 			return state, 0, false, err
 		}
 		if !opts.Quiet {
@@ -171,7 +188,7 @@ func processTurn(ctx context.Context, opts ScanOptions, state exportstate.State,
 		fmt.Fprintf(writerOrDiscard(opts.Stderr), "ERROR: failed to score trace=%s path=%s: %v\n", traceID, sourcePath, err)
 		return state, boolToInt(needsSpans), true, nil
 	}
-	state, err := mutateState(opts.StatePath, state, func(current *exportstate.State) {
+	state, err := mutateState(ctx, opts, state, func(current *exportstate.State) {
 		current.AddProcessed(traceID)
 	})
 	if err != nil {
@@ -227,7 +244,7 @@ func drainQueue(ctx context.Context, opts ScanOptions, state exportstate.State, 
 			}
 		}
 		if hasExportableTurn && requestComplete {
-			state, err = mutateState(opts.StatePath, state, func(current *exportstate.State) {
+			state, err = mutateState(ctx, opts, state, func(current *exportstate.State) {
 				current.RemoveQueued(request)
 			})
 			if err != nil {
@@ -238,15 +255,94 @@ func drainQueue(ctx context.Context, opts ScanOptions, state exportstate.State, 
 	return state, exportedCount, nil
 }
 
-func mutateState(path string, state exportstate.State, mutate func(*exportstate.State)) (exportstate.State, error) {
-	if path == "" {
+func mutateState(ctx context.Context, opts ScanOptions, state exportstate.State, mutate func(*exportstate.State)) (exportstate.State, error) {
+	if opts.StatePath == "" {
 		mutate(&state)
 		return state, nil
 	}
-	return exportstate.Update(path, func(current *exportstate.State) error {
-		mutate(current)
-		return nil
+	return retryStateOperation(ctx, opts, state, func() (exportstate.State, error) {
+		return exportstate.Update(ctx, opts.StatePath, func(current *exportstate.State) error {
+			mutate(current)
+			return nil
+		})
 	})
+}
+
+const (
+	initialStateLockRetryDelay = time.Second
+	maximumStateLockRetryDelay = 30 * time.Second
+	stateLockLogInterval       = time.Minute
+)
+
+type stateLockRetryPolicy struct {
+	initialDelay time.Duration
+	maximumDelay time.Duration
+	logInterval  time.Duration
+	now          func() time.Time
+	wait         func(context.Context, time.Duration) error
+}
+
+func retryStateOperation(ctx context.Context, opts ScanOptions, previous exportstate.State, operation func() (exportstate.State, error)) (exportstate.State, error) {
+	return retryStateOperationWithPolicy(ctx, opts, previous, operation, stateLockRetryPolicy{
+		initialDelay: initialStateLockRetryDelay,
+		maximumDelay: maximumStateLockRetryDelay,
+		logInterval:  stateLockLogInterval,
+		now:          time.Now,
+		wait:         waitStateLockRetry,
+	})
+}
+
+func retryStateOperationWithPolicy(ctx context.Context, opts ScanOptions, previous exportstate.State, operation func() (exportstate.State, error), policy stateLockRetryPolicy) (exportstate.State, error) {
+	delay := policy.initialDelay
+	var started time.Time
+	var lastLogged time.Time
+	for {
+		state, err := operation()
+		if err == nil {
+			if !started.IsZero() && !opts.Quiet {
+				fmt.Fprintf(writerOrDiscard(opts.Stdout), "export state lock recovered path=%s waited=%s\n", opts.StatePath, policy.now().Sub(started).Round(time.Millisecond))
+			}
+			return state, nil
+		}
+		if !errors.Is(err, exportstate.ErrLockBusy) {
+			return previous, err
+		}
+		now := policy.now()
+		if started.IsZero() {
+			started = now
+		}
+		if lastLogged.IsZero() || now.Sub(lastLogged) >= policy.logInterval {
+			var busyErr *exportstate.LockBusyError
+			attemptWait := time.Duration(0)
+			if errors.As(err, &busyErr) {
+				attemptWait = busyErr.Waited
+			}
+			fmt.Fprintf(writerOrDiscard(opts.Stderr), "ERROR: export state lock busy path=%s elapsed=%s retry_in=%s: %v\n", opts.StatePath, (now.Sub(started) + attemptWait).Round(time.Millisecond), delay, err)
+			lastLogged = now
+		}
+		if err := policy.wait(ctx, delay); err != nil {
+			return previous, err
+		}
+		delay = nextStateLockRetryDelay(delay, policy.maximumDelay)
+	}
+}
+
+func waitStateLockRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func nextStateLockRetryDelay(current, maximum time.Duration) time.Duration {
+	if current >= maximum/2 {
+		return maximum
+	}
+	return current * 2
 }
 
 func waitBetweenExports(ctx context.Context, pollIntervalSeconds float64) error {
@@ -269,18 +365,12 @@ func parseQueuedTurns(request exportstate.QueueRequest) ([]agenttrace.Turn, erro
 }
 
 func WatchSessions(ctx context.Context, opts ScanOptions) error {
-	state, err := exportstate.Load(opts.StatePath)
+	current, err := retryStateOperation(ctx, opts, exportstate.State{}, func() (exportstate.State, error) {
+		state, _, err := InitializeState(ctx, opts.StatePath, time.Now(), opts.Stdout, opts.Quiet)
+		return state, err
+	})
 	if err != nil {
 		return err
-	}
-	current := exportstate.State{}
-	if state == nil {
-		current, err = InitializeState(opts.StatePath, time.Now(), opts.Stdout, opts.Quiet)
-		if err != nil {
-			return err
-		}
-	} else {
-		current = *state
 	}
 	if !opts.Quiet {
 		fmt.Fprintf(writerOrDiscard(opts.Stdout), "watching %s\n", opts.Root)

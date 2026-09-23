@@ -1,9 +1,15 @@
 package langfuse
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kirilligum/codex-langfuse-tracer/internal/agenttrace"
 	"github.com/kirilligum/codex-langfuse-tracer/internal/config"
@@ -69,6 +75,129 @@ func TestLiveClaudeParityTrace(t *testing.T) {
 	}
 }
 
+// TestLiveClaudeSmokeTrace checks a basic automatically exported Claude turn
+// without requiring the tool observations needed by TestLiveClaudeParityTrace.
+// TEST-534
+func TestLiveClaudeSmokeTrace(t *testing.T) {
+	traceID := os.Getenv("LIVE_LANGFUSE_CLAUDE_SMOKE_TRACE_ID")
+	if traceID == "" {
+		t.Skip("set LIVE_LANGFUSE_CLAUDE_SMOKE_TRACE_ID to verify a live Claude smoke trace")
+	}
+
+	cfg, err := config.Load(config.DefaultConfigPath())
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	client := NewObservationClient(cfg)
+	query := ObservationQuery{TraceID: traceID, Fields: "core,basic,io,trace_context", Limit: 1000}
+
+	var previousSignature string
+	var stableSince time.Time
+	var lastErr error
+	var lastCount int
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		observations, listErr := client.List(ctx, query)
+		lastErr = listErr
+		lastCount = len(observations)
+		if listErr == nil {
+			roots, transcripts, validationErr := validateClaudeObservationRows(traceID, observations)
+			if validationErr != nil {
+				t.Fatal(validationErr)
+			}
+			if roots > 1 || transcripts > 1 {
+				t.Fatalf("trace %s has duplicate root/transcript rows: roots=%d transcripts=%d observations=%d", traceID, roots, transcripts, len(observations))
+			}
+			if roots == 1 && transcripts == 1 {
+				signature := observationRowsSignature(observations)
+				if signature != previousSignature {
+					previousSignature = signature
+					stableSince = time.Now()
+				} else if time.Since(stableSince) >= 5*time.Second {
+					t.Logf("trace_id=%s root_count=%d transcript_count=%d observation_count=%d stable_for=%s", traceID, roots, transcripts, len(observations), time.Since(stableSince).Round(time.Second))
+					return
+				}
+			} else {
+				previousSignature = ""
+				stableSince = time.Time{}
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			if lastErr != nil {
+				t.Fatalf("timed out waiting for a stable Claude smoke trace %s (observations=%d): %v", traceID, lastCount, lastErr)
+			}
+			t.Fatalf("timed out waiting for a stable Claude smoke trace %s (observations=%d)", traceID, lastCount)
+		case <-ticker.C:
+		}
+	}
+}
+
+// TestLiveCodexSmokeTrace reads an automatically exported Codex canary and
+// rejects duplicate observation IDs or logical root/generation rows.
+func TestLiveCodexSmokeTrace(t *testing.T) {
+	traceID := os.Getenv("LIVE_LANGFUSE_CODEX_SMOKE_TRACE_ID")
+	if traceID == "" {
+		t.Skip("set LIVE_LANGFUSE_CODEX_SMOKE_TRACE_ID to verify a live Codex smoke trace")
+	}
+
+	cfg, err := config.Load(config.DefaultConfigPath())
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	client := NewObservationClient(cfg)
+	query := ObservationQuery{TraceID: traceID, Fields: "core,basic,io,trace_context", Limit: 1000}
+
+	var previousSignature string
+	var stableSince time.Time
+	var lastErr error
+	var lastCount int
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		observations, listErr := client.List(ctx, query)
+		lastErr = listErr
+		lastCount = len(observations)
+		if listErr == nil {
+			roots, transcripts, validationErr := validateCodexObservationRows(traceID, observations)
+			if validationErr != nil {
+				t.Fatal(validationErr)
+			}
+			if roots > 1 || transcripts > 1 {
+				t.Fatalf("trace %s has duplicate root/transcript rows: roots=%d transcripts=%d observations=%d", traceID, roots, transcripts, len(observations))
+			}
+			if roots == 1 && transcripts == 1 {
+				signature := observationRowsSignature(observations)
+				if signature != previousSignature {
+					previousSignature = signature
+					stableSince = time.Now()
+				} else if time.Since(stableSince) >= 5*time.Second {
+					t.Logf("trace_id=%s root_count=%d transcript_count=%d observation_count=%d stable_for=%s", traceID, roots, transcripts, len(observations), time.Since(stableSince).Round(time.Second))
+					return
+				}
+			} else {
+				previousSignature = ""
+				stableSince = time.Time{}
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			if lastErr != nil {
+				t.Fatalf("timed out waiting for a stable Codex smoke trace %s (observations=%d): %v", traceID, lastCount, lastErr)
+			}
+			t.Fatalf("timed out waiting for a stable Codex smoke trace %s (observations=%d)", traceID, lastCount)
+		case <-ticker.C:
+		}
+	}
+}
+
 // TEST-533
 func TestLiveClaudeCostTrace(t *testing.T) {
 	traceID := os.Getenv("LIVE_LANGFUSE_CLAUDE_COST_TRACE_ID")
@@ -126,12 +255,80 @@ func assertClaudeUsageMath(t *testing.T, transcript Observation) {
 func liveClaudeObservations(t *testing.T, cfg config.LangfuseConfig, traceID string) map[string]Observation {
 	t.Helper()
 	result := map[string]Observation{}
-	for _, observation := range liveObservationsForTrace(t, cfg, traceID, "core,basic,io,metadata,model,usage,trace_context") {
+	observations := liveObservationsForTrace(t, cfg, traceID, "core,basic,io,metadata,model,usage,trace_context")
+	roots, transcripts, err := validateClaudeObservationRows(traceID, observations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if roots != 1 || transcripts != 1 {
+		t.Fatalf("Claude trace %s has roots=%d transcripts=%d; want exactly one of each", traceID, roots, transcripts)
+	}
+	for _, observation := range observations {
 		if observation.Name != "" {
 			result[observation.Name] = observation
 		}
 	}
 	return result
+}
+
+func validateClaudeObservationRows(traceID string, observations []Observation) (int, int, error) {
+	return validateObservationRows(traceID, "Claude", "claude.agent", "claude.transcript", observations)
+}
+
+func validateCodexObservationRows(traceID string, observations []Observation) (int, int, error) {
+	return validateObservationRows(traceID, "Codex", "codex.agent", "codex.transcript", observations)
+}
+
+func validateObservationRows(traceID, provider, rootName, transcriptName string, observations []Observation) (int, int, error) {
+	if strings.TrimSpace(traceID) == "" {
+		return 0, 0, fmt.Errorf("%s trace ID is empty", provider)
+	}
+	seenIDs := make(map[string]struct{}, len(observations))
+	var roots, transcripts int
+	for _, observation := range observations {
+		if observation.ID == "" {
+			return roots, transcripts, fmt.Errorf("%s trace %s contains an observation with no ID", provider, traceID)
+		}
+		if _, exists := seenIDs[observation.ID]; exists {
+			return roots, transcripts, fmt.Errorf("%s trace %s contains repeated observation ID %s", provider, traceID, observation.ID)
+		}
+		seenIDs[observation.ID] = struct{}{}
+		if observation.TraceID != traceID {
+			return roots, transcripts, fmt.Errorf("%s trace query %s returned an observation for trace %s", provider, traceID, observation.TraceID)
+		}
+		if observation.Name == transcriptName && observation.IsRootObservation {
+			return roots, transcripts, fmt.Errorf("%s trace %s %s observation is marked as root", provider, traceID, transcriptName)
+		}
+		if observation.IsRootObservation {
+			roots++
+			if observation.Name != rootName {
+				return roots, transcripts, fmt.Errorf("%s trace %s root observation has unexpected name %s", provider, traceID, observation.Name)
+			}
+			var input, output string
+			if json.Unmarshal([]byte(observation.Input), &input) != nil || strings.TrimSpace(input) == "" {
+				return roots, transcripts, fmt.Errorf("%s trace %s root observation has no serialized input", provider, traceID)
+			}
+			if json.Unmarshal([]byte(observation.Output), &output) != nil || strings.TrimSpace(output) == "" {
+				return roots, transcripts, fmt.Errorf("%s trace %s root observation has no serialized output", provider, traceID)
+			}
+		}
+		if observation.Name == rootName && !observation.IsRootObservation {
+			return roots, transcripts, fmt.Errorf("%s trace %s %s observation is not a root", provider, traceID, rootName)
+		}
+		if observation.Name == transcriptName {
+			transcripts++
+		}
+	}
+	return roots, transcripts, nil
+}
+
+func observationRowsSignature(observations []Observation) string {
+	rows := make([]string, 0, len(observations))
+	for _, observation := range observations {
+		rows = append(rows, observation.ID+"\x00"+observation.Name+"\x00"+strconv.FormatBool(observation.IsRootObservation))
+	}
+	sort.Strings(rows)
+	return strings.Join(rows, "\n")
 }
 
 func liveHasString(values []string, want string) bool {

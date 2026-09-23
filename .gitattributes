@@ -1,0 +1,5 @@
+# Shell scripts are executed directly on Linux/macOS by the install/
+# integration tests (test/install_integration_test.go, test/install_test.go).
+# Force LF line endings so a Windows checkout (core.autocrlf=true) does not
+# inject CRLF — a trailing \r makes bash choke on `set -o pipefail\r`.
+*.sh text eol=lf

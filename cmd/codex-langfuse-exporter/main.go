@@ -11,7 +11,9 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/kirilligum/codex-langfuse-tracer/internal/agenttrace"
@@ -140,7 +142,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	if opts.ClaudeHook {
-		enqueued, err := claudehook.Handle(stdin, opts.StateFile, time.Now())
+		enqueued, err := claudehook.Handle(ctx, stdin, opts.StateFile, time.Now())
 		if err != nil {
 			fmt.Fprintf(stderr, "ERROR: %v\n", err)
 			return 1
@@ -175,6 +177,10 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	if opts.Watch {
+		// Only the daemon needs a graceful, successful signal shutdown. Hooks
+		// retain normal signal termination even while blocked reading stdin.
+		ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+		defer stop()
 		err := watch.WatchSessions(ctx, watch.ScanOptions{
 			Root:                config.CodexHome(),
 			StatePath:           opts.StateFile,
@@ -191,6 +197,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 			},
 		})
 		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return 0
+			}
 			fmt.Fprintf(stderr, "ERROR: %v\n", err)
 			return 1
 		}

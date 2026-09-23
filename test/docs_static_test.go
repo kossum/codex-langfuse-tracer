@@ -41,11 +41,16 @@ func TestDocsCompletedCodexVisibility(t *testing.T) {
 	for _, required := range []string{
 		"Incomplete turns remain local until Codex records completion",
 		"one clean Langfuse batch",
+		"every completed exportable turn",
+		"`--turn-id` restricts the local input only",
+		"does not read or update watcher state",
 		"`processed_trace_ids`",
 		"`pending_scores[trace_id]`",
 		"Langfuse v4 observation fields",
 		"Deprecated trace-level input/output fields are not emitted",
 		"at-least-once",
+		"span_export_succeeded ... checkpoint=pending",
+		"span_checkpoint_unconfirmed",
 		"does not stream tokens or partial assistant text",
 		"currently configured Langfuse target",
 	} {
@@ -58,7 +63,10 @@ func TestDocsCompletedCodexVisibility(t *testing.T) {
 		"TestVersion3State|TestStateUpdatePreservesQueue",
 		"TestOTLPCompletedTurnSingleBatch|TestCanonicalObservationIO",
 		"TestIncompleteTurnWaitsForCompletion|TestCompletedTurnScoreRetryUsesStableEnvironment|TestWatchLogs",
+		"TestWatchSpanCheckpointFailureLogs",
 		"TestEvalWatchExportLatency",
+		"LIVE_LANGFUSE_CODEX_SMOKE_TRACE_ID",
+		"TestLiveCodexSmokeTrace",
 	} {
 		if !strings.Contains(testingDoc, required) {
 			t.Fatalf("TESTING missing completed-turn command fragment %q", required)
@@ -140,7 +148,7 @@ func TestDocsWorkspaceIdentity(t *testing.T) {
 		"--json",
 		"trace_url",
 		"deterministic trace-level Langfuse scores",
-		"They do not make extra LLM calls",
+		"The scores do not make extra LLM calls.",
 		"`langfuse.environment`",
 		"`repository-folder--branch-<hash>`",
 		"first six lowercase hexadecimal SHA-256",
@@ -153,7 +161,9 @@ func TestDocsWorkspaceIdentity(t *testing.T) {
 		"version 3",
 		"systemctl --user stop codex-langfuse-watch.service",
 		"rm -- ~/.codex/langfuse-export-state.json",
-		"It is the only required service-start step",
+		"This reset does **not** apply to the version 3 lock-protocol upgrade.",
+		"Keep the version 3 state JSON and its `.lock` sidecar",
+		"The installer is the only required service-start step",
 	} {
 		if !strings.Contains(readme, required) {
 			t.Fatalf("README missing %q", required)
@@ -163,7 +173,7 @@ func TestDocsWorkspaceIdentity(t *testing.T) {
 	removeIndex := strings.Index(readme, "rm -- ~/.codex/langfuse-export-state.json")
 	installIndex := strings.Index(readme, "./install.sh")
 	if stopIndex >= removeIndex || removeIndex >= installIndex {
-		t.Fatal("README must document the state cutover as stop, remove state, then install")
+		t.Fatal("README must document the pre-version-3 state reset as stop, remove state, then install")
 	}
 	if strings.Contains(readme, "systemctl --user start codex-langfuse-watch.service") {
 		t.Fatal("README must use install.sh as the only service-start path")
@@ -206,6 +216,49 @@ func TestDocsWorkspaceIdentity(t *testing.T) {
 			if strings.Contains(document.text, forbidden) {
 				t.Fatalf("%s retains legacy identity surface %q", document.name, forbidden)
 			}
+		}
+	}
+}
+
+func TestDocsExportStateLockUpgrade(t *testing.T) {
+	t.Parallel()
+
+	readme := readRepoDoc(t, "README.md")
+	testingDoc := readRepoDoc(t, "TESTING.md")
+	plan := readRepoDoc(t, filepath.Join("plans", "export-state-lock-recovery-plan.md"))
+	for _, required := range []string{
+		"older `O_EXCL` lock protocol",
+		"pause new Claude `Stop` hook invocations",
+		"The installer synchronously stops its loaded systemd watcher",
+		"persistent, empty advisory-lock file",
+		"Do not delete or rename the `.lock` sidecar",
+	} {
+		if !strings.Contains(readme, required) {
+			t.Fatalf("README missing %q", required)
+		}
+	}
+	for _, required := range []string{
+		"TestStateLockRecoversAfterKilledOwner",
+		"TestStateInterruptedWritePreservesCommittedJSON",
+		"TestStateWriteErrorsPreserveCommittedFile",
+		"TestWatchRetriesPendingCheckpointOnly",
+		"TestClaudeHookLockTimeoutIsNotAcknowledged",
+		"TestCLISignalCancelsStateWait",
+		"TestInstallReportsPostStopFailureState",
+		"go test -race ./internal/exportstate ./internal/claudehook ./internal/watch",
+	} {
+		if !strings.Contains(testingDoc, required) {
+			t.Fatalf("TESTING missing %q", required)
+		}
+	}
+	for _, required := range []string{
+		"Legacy and new writers cannot safely coexist.",
+		"TestStateLoadOrCreatePreservesEnqueueInEitherOrder",
+		"TestWatchRetriesQueueRemovalAfterCheckpoint",
+		"forced-kill tests against disposable state",
+	} {
+		if !strings.Contains(plan, required) {
+			t.Fatalf("lock recovery plan missing %q", required)
 		}
 	}
 }
@@ -314,7 +367,7 @@ func TestDocsTagsAndMCPUsage(t *testing.T) {
 		"issues/list",
 		"internal/agenttrace/TAG_RULES.md",
 		"future watcher exports",
-		"explicit re-export",
+		"Do not resend an old turn to add tags or MCP metadata",
 		"codex-langfuse-watch.service",
 		"~/.codex/bin/codex-langfuse-exporter --path",
 	} {
@@ -365,7 +418,7 @@ func TestDocsLangfuseCostPricing(t *testing.T) {
 		"internal/langfuse/models.go",
 		"Do not add fallback local cost multiplication",
 		"install.sh",
-		"explicit re-export",
+		"Do not re-export an old turn to backfill its cost",
 		"~/.codex/bin/codex-langfuse-exporter --session-id",
 	} {
 		if !strings.Contains(readme, required) {
@@ -437,6 +490,11 @@ func TestDocsClaudeSupportContract(t *testing.T) {
 		"go test ./internal/claudetrace -count=1",
 		"go test ./internal/claudehook ./internal/exportstate ./internal/watch -run 'TestClaudeHookEnqueuesStopOnly|TestExportStateQueueDedupe|TestWatchDrainsClaudeQueue|TestWatchReloadsClaudeQueueFromHookState' -count=1",
 		"go test ./cmd/codex-langfuse-exporter -run 'TestCLIProviderSelection|TestManualProviderExportCLIIntegration' -count=1",
+		"TestLiveClaudeSmokeTrace",
+		"LIVE_LANGFUSE_CLAUDE_SMOKE_TRACE_ID",
+		"Full tool parity is a separate optional live check",
+		"A reply-only smoke trace cannot pass it",
+		"Do not manually export this transcript",
 		"CHECK-001",
 	} {
 		if !strings.Contains(testingDoc, required) {

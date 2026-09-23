@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -24,7 +26,7 @@ func TestIncompleteTurnWaitsForCompletion(t *testing.T) {
 	now := time.Date(2026, 5, 1, 11, 1, 0, 0, time.UTC)
 	setMTime(t, rolloutPath, now.Add(-time.Second))
 	state := exportstate.State{Version: exportstate.Version, ScanWatermarkNS: now.Add(-time.Minute).UnixNano()}
-	if err := exportstate.Save(statePath, state); err != nil {
+	if err := exportstate.Save(context.Background(), statePath, state); err != nil {
 		t.Fatal(err)
 	}
 	parsed, err := codextrace.ParseTurns(rolloutPath)
@@ -86,7 +88,7 @@ func TestCompletedTurnScoreRetryUsesStableEnvironment(t *testing.T) {
 	now := time.Date(2026, 5, 1, 11, 1, 0, 0, time.UTC)
 	setMTime(t, rolloutPath, now.Add(-time.Second))
 	state := exportstate.State{Version: exportstate.Version, ScanWatermarkNS: now.Add(-time.Minute).UnixNano()}
-	if err := exportstate.Save(statePath, state); err != nil {
+	if err := exportstate.Save(context.Background(), statePath, state); err != nil {
 		t.Fatal(err)
 	}
 	const environment = "repository--feature-one-a1b2c3"
@@ -94,10 +96,11 @@ func TestCompletedTurnScoreRetryUsesStableEnvironment(t *testing.T) {
 	scoreCalls := 0
 	resolverCalls := 0
 	scoreFailed := true
+	var stdout bytes.Buffer
 	opts := ScanOptions{
 		Root:      root,
 		StatePath: statePath,
-		Quiet:     true,
+		Stdout:    &stdout,
 		ResolveWorkspace: func(_ context.Context, turn agenttrace.Turn) (agenttrace.Turn, string, error) {
 			resolverCalls++
 			return turn, environment, nil
@@ -128,14 +131,21 @@ func TestCompletedTurnScoreRetryUsesStableEnvironment(t *testing.T) {
 	if exported != 1 || spanCalls != 1 || scoreCalls != 1 || state.HasProcessed(traceID) || state.PendingScoreEnvironment(traceID) != environment {
 		t.Fatalf("failed score checkpoint = exported:%d spans:%d scores:%d state:%+v", exported, spanCalls, scoreCalls, state)
 	}
+	if !strings.Contains(stdout.String(), "span_export_succeeded trace="+traceID+" status=202 checkpoint=pending") {
+		t.Fatalf("initial successful span export was not diagnosed: %s", stdout.String())
+	}
 
 	scoreFailed = false
+	stdout.Reset()
 	state, exported, err = ScanOnce(context.Background(), withScanNow(opts, now.Add(time.Second)), state)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if exported != 0 || spanCalls != 1 || scoreCalls != 2 || resolverCalls != 1 || !state.HasProcessed(traceID) || state.PendingScoreEnvironment(traceID) != "" {
 		t.Fatalf("score retry re-exported or changed environment: exported:%d spans:%d scores:%d resolver:%d state:%+v", exported, spanCalls, scoreCalls, resolverCalls, state)
+	}
+	if strings.Contains(stdout.String(), "span_export_succeeded") {
+		t.Fatalf("score-only retry logged a span send: %s", stdout.String())
 	}
 }
 
@@ -147,7 +157,7 @@ func TestWatchEnvironmentPersistsOnlyAfterSuccessfulSpanExport(t *testing.T) {
 	now := time.Date(2026, 5, 1, 11, 1, 0, 0, time.UTC)
 	setMTime(t, rolloutPath, now.Add(-time.Second))
 	state := exportstate.State{Version: exportstate.Version, ScanWatermarkNS: now.Add(-time.Minute).UnixNano()}
-	if err := exportstate.Save(statePath, state); err != nil {
+	if err := exportstate.Save(context.Background(), statePath, state); err != nil {
 		t.Fatal(err)
 	}
 	const environment = "repository--feature-one-a1b2c3"
@@ -187,7 +197,7 @@ func TestWatchScanSemantics(t *testing.T) {
 	copyFile(t, filepath.Join("..", "..", "testdata", "sources", "codex", "corrupt-rollout.jsonl"), corrupt)
 	setMTime(t, corrupt, old)
 	state := exportstate.State{Version: exportstate.Version, ScanWatermarkNS: now.Add(-2 * time.Minute).UnixNano()}
-	if err := exportstate.Save(statePath, state); err != nil {
+	if err := exportstate.Save(context.Background(), statePath, state); err != nil {
 		t.Fatal(err)
 	}
 	var stderr bytes.Buffer
@@ -212,6 +222,9 @@ func TestWatchScanSemantics(t *testing.T) {
 	}
 	if !bytes.Contains(stderr.Bytes(), []byte("warning: skipped unreadable rollout")) {
 		t.Fatalf("missing corrupt warning: %s", stderr.String())
+	}
+	if err := os.Remove(corrupt); err != nil {
+		t.Fatalf("remove corrupt fixture after warning: %v", err)
 	}
 
 	state, exported, err = ScanOnce(context.Background(), ScanOptions{
@@ -252,6 +265,102 @@ func TestWatchScanSemantics(t *testing.T) {
 	}
 }
 
+func TestWatchParseErrorDoesNotAdvanceWatermark(t *testing.T) {
+	t.Parallel()
+
+	root, statePath, rolloutPath := watchFixture(t)
+	now := time.Date(2026, 5, 1, 10, 1, 0, 0, time.UTC)
+	watermark := now.Add(-time.Minute).UnixNano()
+	setMTime(t, rolloutPath, now.Add(-2*time.Minute))
+	corrupt := filepath.Join(filepath.Dir(rolloutPath), "rollout-corrupt.jsonl")
+	copyFile(t, filepath.Join("..", "..", "testdata", "sources", "codex", "corrupt-rollout.jsonl"), corrupt)
+	setMTime(t, corrupt, now.Add(-30*time.Second))
+	state := exportstate.State{Version: exportstate.Version, ScanWatermarkNS: watermark}
+	if err := exportstate.Save(context.Background(), statePath, state); err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+
+	state, exported, err := ScanOnce(context.Background(), ScanOptions{
+		Root:      root,
+		StatePath: statePath,
+		Now:       now,
+		Stderr:    &stderr,
+	}, state)
+	if err != nil {
+		t.Fatalf("ScanOnce: %v", err)
+	}
+	if exported != 0 || state.ScanWatermarkNS != watermark {
+		t.Fatalf("corrupt rollout advanced scan: exported=%d watermark=%d want=%d", exported, state.ScanWatermarkNS, watermark)
+	}
+	if !bytes.Contains(stderr.Bytes(), []byte("warning: skipped unreadable rollout")) {
+		t.Fatalf("missing corrupt-rollout diagnostic: %s", stderr.String())
+	}
+}
+
+func TestWatchFiltersProcessedTurnsBeforeRetainingObservations(t *testing.T) {
+	t.Parallel()
+
+	const processedTurns = 2000
+	root, _, rolloutPath := watchFixture(t)
+	now := time.Date(2026, 5, 1, 10, 1, 0, 0, time.UTC)
+	var source strings.Builder
+	source.WriteString(`{"timestamp":"2026-05-01T10:00:00Z","type":"session_meta","payload":{"id":"sess-watch-filter"}}` + "\n")
+	message := strings.Repeat("already processed response ", 24)
+	processedTraceIDs := make([]string, 0, processedTurns)
+	for index := 0; index < processedTurns; index++ {
+		turnID := fmt.Sprintf("processed-%d", index)
+		traceID := agenttrace.StableTraceID(agenttrace.ProviderCodex, "sess-watch-filter", turnID)
+		processedTraceIDs = append(processedTraceIDs, traceID)
+		fmt.Fprintf(&source, `{"timestamp":"2026-05-01T10:00:01Z","type":"turn_context","payload":{"turn_id":%q,"trace_id":%q}}`+"\n", turnID, traceID)
+		fmt.Fprintf(&source, `{"timestamp":"2026-05-01T10:00:02Z","type":"event_msg","payload":{"type":"agent_message","phase":"commentary","message":%q}}`+"\n", message)
+	}
+	newTurnID := "new-turn"
+	newTraceID := agenttrace.StableTraceID(agenttrace.ProviderCodex, "sess-watch-filter", newTurnID)
+	fmt.Fprintf(&source, `{"timestamp":"2026-05-01T10:00:03Z","type":"turn_context","payload":{"turn_id":%q,"trace_id":%q}}`+"\n", newTurnID, newTraceID)
+	source.WriteString(`{"timestamp":"2026-05-01T10:00:04Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"new input"}]}}` + "\n")
+	source.WriteString(`{"timestamp":"2026-05-01T10:00:05Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"new output"}]}}` + "\n")
+	source.WriteString(`{"timestamp":"2026-05-01T10:00:06Z","type":"event_msg","payload":{"type":"task_complete"}}` + "\n")
+	if err := os.WriteFile(rolloutPath, []byte(source.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	setMTime(t, rolloutPath, now.Add(-30*time.Second))
+	sort.Strings(processedTraceIDs)
+	state := exportstate.State{
+		Version:           exportstate.Version,
+		ScanWatermarkNS:   now.Add(-time.Minute).UnixNano(),
+		ProcessedTraceIDs: processedTraceIDs,
+	}
+	spanCalls := 0
+	scoreCalls := 0
+	state, exported, err := ScanOnce(context.Background(), ScanOptions{
+		Root:             root,
+		Now:              now,
+		Quiet:            true,
+		ResolveWorkspace: testWorkspace,
+		ExportSpans: func(_ context.Context, turn agenttrace.Turn, _ string) (int, error) {
+			spanCalls++
+			if turn.TraceID != newTraceID {
+				t.Errorf("unexpected span export for trace %s", turn.TraceID)
+			}
+			return 200, nil
+		},
+		ExportScores: func(_ context.Context, turn agenttrace.Turn, _ string) error {
+			scoreCalls++
+			if turn.TraceID != newTraceID {
+				t.Errorf("unexpected score export for trace %s", turn.TraceID)
+			}
+			return nil
+		},
+	}, state)
+	if err != nil {
+		t.Fatalf("ScanOnce: %v", err)
+	}
+	if exported != 1 || spanCalls != 1 || scoreCalls != 1 || !state.HasProcessed(newTraceID) {
+		t.Fatalf("processed-turn filtering failed: exported=%d spans=%d scores=%d state=%+v", exported, spanCalls, scoreCalls, state)
+	}
+}
+
 func TestInitializeStateAndWatchCancel(t *testing.T) {
 	t.Parallel()
 
@@ -259,9 +368,12 @@ func TestInitializeStateAndWatchCancel(t *testing.T) {
 	statePath := filepath.Join(root, "state.json")
 	now := time.Date(2026, 5, 1, 10, 30, 0, 0, time.UTC)
 	var stdout bytes.Buffer
-	state, err := InitializeState(statePath, now, &stdout, false)
+	state, created, err := InitializeState(context.Background(), statePath, now, &stdout, false)
 	if err != nil {
 		t.Fatalf("InitializeState: %v", err)
+	}
+	if !created {
+		t.Fatal("InitializeState did not report creating a missing state file")
 	}
 	wantWatermark := now.Add(-time.Duration(buildinfo.DefaultInitialLookbackSecs) * time.Second).UnixNano()
 	if state.Version != exportstate.Version || state.ScanWatermarkNS != wantWatermark {
@@ -292,7 +404,7 @@ func TestWatchDrainsClaudeQueue(t *testing.T) {
 		EnqueuedAt: time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC).Format(time.RFC3339Nano),
 	}},
 	}
-	if err := exportstate.Save(statePath, state); err != nil {
+	if err := exportstate.Save(context.Background(), statePath, state); err != nil {
 		t.Fatal(err)
 	}
 	exportedTraceIDs := []string{}
@@ -321,7 +433,7 @@ func TestWatchReloadsClaudeQueueFromHookState(t *testing.T) {
 	statePath := filepath.Join(root, "langfuse-export-state.json")
 	transcriptPath := filepath.Join(root, "claude-no-tools.jsonl")
 	copyFile(t, filepath.Join("..", "..", "testdata", "sources", "claude", "no-tools.jsonl"), transcriptPath)
-	if err := exportstate.Save(statePath, exportstate.State{Version: exportstate.Version, ScanWatermarkNS: time.Date(2026, 5, 4, 11, 59, 0, 0, time.UTC).UnixNano()}); err != nil {
+	if err := exportstate.Save(context.Background(), statePath, exportstate.State{Version: exportstate.Version, ScanWatermarkNS: time.Date(2026, 5, 4, 11, 59, 0, 0, time.UTC).UnixNano()}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -329,20 +441,32 @@ func TestWatchReloadsClaudeQueueFromHookState(t *testing.T) {
 	defer cancel()
 	exported := make(chan string, 1)
 	errCh := make(chan error, 1)
+	watchReady := make(chan struct{}, 1)
+	spanCalls := 0
+	scoreCalls := 0
 	go func() {
 		errCh <- WatchSessions(ctx, ScanOptions{
-			Root: root, StatePath: statePath, ResolveWorkspace: testWorkspace, PollIntervalSeconds: 0.01, Quiet: true,
+			Root: root, StatePath: statePath, ResolveWorkspace: testWorkspace, PollIntervalSeconds: 0.01, Stdout: watcherReadyWriter(watchReady),
 			ExportSpans: func(_ context.Context, turn agenttrace.Turn, _ string) (int, error) {
+				spanCalls++
 				exported <- turn.TraceID
-				cancel()
 				return 202, nil
 			},
-			ExportScores: successfulScores,
+			ExportScores: func(context.Context, agenttrace.Turn, string) error {
+				scoreCalls++
+				return nil
+			},
 		})
 	}()
 
-	time.Sleep(50 * time.Millisecond)
-	if err := exportstate.Enqueue(statePath, exportstate.QueueRequest{
+	select {
+	case <-watchReady:
+	case err := <-errCh:
+		t.Fatalf("WatchSessions exited before startup: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("WatchSessions did not finish startup")
+	}
+	if err := exportstate.Enqueue(context.Background(), statePath, exportstate.QueueRequest{
 		Provider: agenttrace.ProviderClaude, SourcePath: transcriptPath, SessionID: "claude-no-tools",
 		CWD: root, EnqueuedAt: time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC).Format(time.RFC3339Nano),
 	}); err != nil {
@@ -356,8 +480,32 @@ func TestWatchReloadsClaudeQueueFromHookState(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("WatchSessions did not reload and drain queued Claude request")
 	}
+	deadline := time.NewTimer(2 * time.Second)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer deadline.Stop()
+	defer ticker.Stop()
+	for {
+		loaded, err := exportstate.Load(statePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if loaded.HasProcessed(traceID) && len(loaded.Queue) == 0 {
+			break
+		}
+		select {
+		case err := <-errCh:
+			t.Fatalf("WatchSessions exited before queue commit: %v", err)
+		case <-deadline.C:
+			t.Fatalf("queued request did not commit: %+v", loaded)
+		case <-ticker.C:
+		}
+	}
+	cancel()
 	if err := <-errCh; !errors.Is(err, context.Canceled) {
 		t.Fatalf("WatchSessions error = %v", err)
+	}
+	if spanCalls != 1 || scoreCalls != 1 {
+		t.Fatalf("span calls=%d score calls=%d, want one each", spanCalls, scoreCalls)
 	}
 	loaded, err := exportstate.Load(statePath)
 	if err != nil {
@@ -368,11 +516,120 @@ func TestWatchReloadsClaudeQueueFromHookState(t *testing.T) {
 	}
 }
 
+type watcherReadyWriter chan struct{}
+
+func (writer watcherReadyWriter) Write(data []byte) (int, error) {
+	if bytes.Contains(data, []byte("watching ")) {
+		select {
+		case writer <- struct{}{}:
+		default:
+		}
+	}
+	return len(data), nil
+}
+
 func TestWaitBetweenExportsHonorsCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if err := waitBetweenExports(ctx, 60); !errors.Is(err, context.Canceled) {
 		t.Fatalf("waitBetweenExports error = %v, want context canceled", err)
+	}
+}
+
+func TestWatchLockBackoffLogThrottleAndShutdown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	previous := exportstate.State{Version: exportstate.Version, ScanWatermarkNS: 123, ProcessedTraceIDs: []string{"kept"}}
+	var stderr, stdout bytes.Buffer
+	fakeNow := time.Date(2026, 9, 21, 12, 0, 0, 0, time.UTC)
+	var delays []time.Duration
+	policy := stateLockRetryPolicy{
+		initialDelay: time.Second,
+		maximumDelay: 30 * time.Second,
+		logInterval:  time.Minute,
+		now:          func() time.Time { return fakeNow },
+		wait: func(ctx context.Context, delay time.Duration) error {
+			delays = append(delays, delay)
+			fakeNow = fakeNow.Add(delay)
+			if len(delays) == 7 {
+				cancel()
+				return ctx.Err()
+			}
+			return nil
+		},
+	}
+	operationCalls := 0
+	got, err := retryStateOperationWithPolicy(ctx, ScanOptions{StatePath: "/tmp/state.json", Stdout: &stdout, Stderr: &stderr}, previous, func() (exportstate.State, error) {
+		operationCalls++
+		return exportstate.State{}, &exportstate.LockBusyError{Path: "/tmp/state.json.lock", Waited: 2 * time.Second}
+	}, policy)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("retry result error = %v, want context canceled", err)
+	}
+	if operationCalls != 7 {
+		t.Fatalf("operation calls = %d, want 7", operationCalls)
+	}
+	wantDelays := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second, 30 * time.Second, 30 * time.Second}
+	if len(delays) != len(wantDelays) {
+		t.Fatalf("retry delays = %v, want %v", delays, wantDelays)
+	}
+	for index := range wantDelays {
+		if delays[index] != wantDelays[index] {
+			t.Fatalf("retry delays = %v, want %v", delays, wantDelays)
+		}
+	}
+	if got.ScanWatermarkNS != previous.ScanWatermarkNS || !got.HasProcessed("kept") {
+		t.Fatalf("canceled retry changed prior state: %+v", got)
+	}
+	if count := strings.Count(stderr.String(), "ERROR: export state lock busy"); count != 2 {
+		t.Fatalf("contention log count = %d, want first timeout and one after 60 seconds: %s", count, stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("canceled retry reported recovery: %s", stdout.String())
+	}
+
+	fakeNow = time.Date(2026, 9, 21, 13, 0, 0, 0, time.UTC)
+	delays = nil
+	stderr.Reset()
+	stdout.Reset()
+	policy.wait = func(_ context.Context, delay time.Duration) error {
+		delays = append(delays, delay)
+		fakeNow = fakeNow.Add(delay)
+		return nil
+	}
+	recoveryCalls := 0
+	got, err = retryStateOperationWithPolicy(context.Background(), ScanOptions{StatePath: "/tmp/state.json", Stdout: &stdout, Stderr: &stderr}, previous, func() (exportstate.State, error) {
+		recoveryCalls++
+		if recoveryCalls < 3 {
+			return exportstate.State{}, &exportstate.LockBusyError{Path: "/tmp/state.json.lock", Waited: 2 * time.Second}
+		}
+		return exportstate.State{Version: exportstate.Version, ScanWatermarkNS: 456}, nil
+	}, policy)
+	if err != nil || got.ScanWatermarkNS != 456 || recoveryCalls != 3 {
+		t.Fatalf("successful recovery state=%+v calls=%d err=%v", got, recoveryCalls, err)
+	}
+	if len(delays) != 2 || delays[0] != time.Second || delays[1] != 2*time.Second {
+		t.Fatalf("successful recovery delays = %v, want [1s 2s]", delays)
+	}
+	if !strings.Contains(stdout.String(), "export state lock recovered path=/tmp/state.json waited=3s") {
+		t.Fatalf("recovery log = %q", stdout.String())
+	}
+	secondOperationCalls := 0
+	secondDelays := make([]time.Duration, 0, 1)
+	policy.wait = func(_ context.Context, delay time.Duration) error {
+		secondDelays = append(secondDelays, delay)
+		fakeNow = fakeNow.Add(delay)
+		return nil
+	}
+	_, err = retryStateOperationWithPolicy(context.Background(), ScanOptions{StatePath: "/tmp/state.json", Quiet: true}, got, func() (exportstate.State, error) {
+		secondOperationCalls++
+		if secondOperationCalls == 1 {
+			return exportstate.State{}, &exportstate.LockBusyError{Path: "/tmp/state.json.lock", Waited: 2 * time.Second}
+		}
+		return got, nil
+	}, policy)
+	if err != nil || len(secondDelays) != 1 || secondDelays[0] != time.Second {
+		t.Fatalf("retry delay did not reset after recovery: delays=%v err=%v", secondDelays, err)
 	}
 }
 
@@ -385,7 +642,7 @@ func TestWatchLogs(t *testing.T) {
 	now := time.Date(2026, 5, 1, 10, 1, 0, 0, time.UTC)
 	setMTime(t, rolloutPath, now.Add(-30*time.Second))
 	state := exportstate.State{Version: exportstate.Version, ScanWatermarkNS: now.Add(-2 * time.Minute).UnixNano()}
-	if err := exportstate.Save(statePath, state); err != nil {
+	if err := exportstate.Save(context.Background(), statePath, state); err != nil {
 		t.Fatal(err)
 	}
 	var stdout, stderr bytes.Buffer
@@ -397,13 +654,17 @@ func TestWatchLogs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(stdout.Bytes(), []byte("exported trace=1e087e4ea8aa8d8e29e604d2cd8704d9 status=201 path=")) ||
+	successLog := stdout.String()
+	spanSuccess := strings.Index(successLog, "span_export_succeeded trace=1e087e4ea8aa8d8e29e604d2cd8704d9 status=201 checkpoint=pending")
+	exported := strings.Index(successLog, "exported trace=1e087e4ea8aa8d8e29e604d2cd8704d9 status=201 path=")
+	scored := strings.Index(successLog, "scored trace=1e087e4ea8aa8d8e29e604d2cd8704d9 path=")
+	if spanSuccess < 0 || exported < 0 || scored < 0 || spanSuccess >= exported || exported >= scored ||
 		!bytes.Contains(stdout.Bytes(), []byte("scored trace=1e087e4ea8aa8d8e29e604d2cd8704d9 path=")) {
-		t.Fatalf("success log missing: %s", stdout.String())
+		t.Fatalf("success log order is wrong: %s", successLog)
 	}
 
 	state = exportstate.State{Version: exportstate.Version, ScanWatermarkNS: now.Add(-2 * time.Minute).UnixNano()}
-	if err := exportstate.Save(statePath, state); err != nil {
+	if err := exportstate.Save(context.Background(), statePath, state); err != nil {
 		t.Fatal(err)
 	}
 	stdout.Reset()
@@ -419,10 +680,134 @@ func TestWatchLogs(t *testing.T) {
 	if !bytes.Contains(stderr.Bytes(), []byte("ERROR: failed to export trace=1e087e4ea8aa8d8e29e604d2cd8704d9")) {
 		t.Fatalf("failure log missing: %s", stderr.String())
 	}
+	if strings.Contains(stdout.String()+stderr.String(), "span_export_succeeded") || strings.Contains(stdout.String()+stderr.String(), "span_checkpoint_unconfirmed") {
+		t.Fatalf("failed span callback emitted a success/checkpoint diagnostic: stdout=%s stderr=%s", stdout.String(), stderr.String())
+	}
 	logs := stdout.String() + stderr.String()
 	for _, secretContent := range []string{"Summarize the repo", "Checks passed", "sk-lf-live-secret"} {
 		if strings.Contains(logs, secretContent) {
 			t.Fatalf("watch logs leaked %q: %s", secretContent, logs)
+		}
+	}
+
+	if err := exportstate.Save(context.Background(), statePath, state); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	_, _, err = ScanOnce(context.Background(), ScanOptions{
+		Root: root, StatePath: statePath, ResolveWorkspace: testWorkspace, Now: now, Stdout: &stdout, Stderr: &stderr, Quiet: true,
+		ExportSpans:  func(context.Context, agenttrace.Turn, string) (int, error) { return 201, nil },
+		ExportScores: successfulScores,
+	}, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stdout.Len() != 0 || strings.Contains(stderr.String(), "span_export_succeeded") {
+		t.Fatalf("quiet success emitted a success diagnostic: stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+}
+
+// TEST-706
+func TestWatchSpanCheckpointFailureLogs(t *testing.T) {
+	t.Parallel()
+
+	for _, quiet := range []bool{false, true} {
+		t.Run(map[bool]string{false: "normal", true: "quiet"}[quiet], func(t *testing.T) {
+			t.Parallel()
+			root, statePath, rolloutPath := watchFixture(t)
+			now := time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)
+			setMTime(t, rolloutPath, now.Add(-time.Second))
+			initial := exportstate.State{Version: exportstate.Version, ScanWatermarkNS: now.Add(-time.Minute).UnixNano(), ProcessedTraceIDs: []string{"previous-trace"}}
+			if err := exportstate.Save(context.Background(), statePath, initial); err != nil {
+				t.Fatal(err)
+			}
+			initialBytes, err := os.ReadFile(statePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			var stdout, stderr bytes.Buffer
+			spanCalls, scoreCalls := 0, 0
+			_, _, scanErr := ScanOnce(ctx, ScanOptions{
+				Root: root, StatePath: statePath, ResolveWorkspace: testWorkspace, Now: now, Quiet: quiet, Stdout: &stdout, Stderr: &stderr,
+				ExportSpans: func(context.Context, agenttrace.Turn, string) (int, error) {
+					spanCalls++
+					cancel()
+					return 202, nil
+				},
+				ExportScores: func(context.Context, agenttrace.Turn, string) error {
+					scoreCalls++
+					return nil
+				},
+			}, initial)
+			cancel()
+			if !errors.Is(scanErr, context.Canceled) {
+				t.Fatalf("ScanOnce error = %v, want context canceled", scanErr)
+			}
+			if spanCalls != 1 || scoreCalls != 0 {
+				t.Fatalf("callbacks = spans:%d scores:%d, want spans:1 scores:0", spanCalls, scoreCalls)
+			}
+			traceID := completeTraceID(t, rolloutPath)
+			expectedError := "ERROR: span_checkpoint_unconfirmed trace=" + traceID + " export_result=success replay_possible=true"
+			if strings.Count(stderr.String(), expectedError) != 1 {
+				t.Fatalf("checkpoint diagnostic = %q, want exactly one %q", stderr.String(), expectedError)
+			}
+			if strings.Contains(stdout.String(), "exported trace=") || strings.Contains(stdout.String(), "scored trace=") {
+				t.Fatalf("checkpoint failure logged a completed checkpoint: %q", stdout.String())
+			}
+			if got := strings.Count(stdout.String(), "span_export_succeeded trace="+traceID+" status=202 checkpoint=pending"); got != map[bool]int{false: 1, true: 0}[quiet] {
+				t.Fatalf("span success diagnostic count = %d in quiet=%v; log=%q", got, quiet, stdout.String())
+			}
+			for _, private := range []string{"Summarize the repo", "Checks passed", "sk-lf-live-secret"} {
+				if strings.Contains(stdout.String()+stderr.String(), private) {
+					t.Fatalf("checkpoint diagnostics contain private content %q", private)
+				}
+			}
+			afterBytes, err := os.ReadFile(statePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(afterBytes, initialBytes) {
+				t.Fatalf("checkpoint error mutated durable state: before=%s after=%s", initialBytes, afterBytes)
+			}
+		})
+	}
+}
+
+type watchEventLogWriter chan string
+
+func (writer watchEventLogWriter) Write(data []byte) (int, error) {
+	line := strings.TrimSpace(string(bytes.Clone(data)))
+	writer <- line
+	return len(data), nil
+}
+
+func waitForWatchEvent(t *testing.T, lines <-chan string, prefix string) string {
+	t.Helper()
+	timer := time.NewTimer(6 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case line := <-lines:
+			if strings.HasPrefix(line, prefix) {
+				return line
+			}
+		case <-timer.C:
+			t.Fatalf("timed out waiting for watch event %q", prefix)
+		}
+	}
+}
+
+func drainWatchEvents(lines <-chan string) []string {
+	var result []string
+	for {
+		select {
+		case line := <-lines:
+			result = append(result, line)
+		default:
+			return result
 		}
 	}
 }
@@ -439,7 +824,7 @@ func TestEvalHookQueueDrainLatency(t *testing.T) {
 		Provider: agenttrace.ProviderClaude, SourcePath: transcriptPath, SessionID: "claude-no-tools",
 		EnqueuedAt: time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC).Format(time.RFC3339Nano),
 	}}}
-	if err := exportstate.Save(statePath, state); err != nil {
+	if err := exportstate.Save(context.Background(), statePath, state); err != nil {
 		t.Fatal(err)
 	}
 	start := time.Now()

@@ -127,7 +127,7 @@ chmod 600 ~/.codex/config.toml
 
 ### 3. Install
 
-Older watcher state is intentionally incompatible and is not migrated. When upgrading a machine with an older state file, stop the existing watcher and perform this one-time destructive reset before installing:
+State files from releases before schema version 3 are incompatible. Only when upgrading from one of those older schemas, stop the watcher and perform this destructive reset before installing:
 
 ```sh
 systemctl --user stop codex-langfuse-watch.service
@@ -136,11 +136,15 @@ rm -- ~/.codex/langfuse-export-state.json
 
 Removing the file discards processed IDs, queued requests, the scan watermark, and pending score retries. There is no compatibility state, backup path, or migration command.
 
+This reset does **not** apply to the version 3 lock-protocol upgrade. Keep the version 3 state JSON and its `.lock` sidecar; they contain processed IDs, queued hook requests, pending score retries, and the scan watermark. The update changes locking only and preserves the state schema.
+
+For the first update from the older `O_EXCL` lock protocol, pause new Claude `Stop` hook invocations and any other independently launched state writers. Let in-flight writers finish, and stop any manually launched legacy watchers. The installer synchronously stops its loaded systemd watcher after its staged build and Langfuse pricing preflight pass, then promotes the staged binary and unit. It cannot pause Claude hooks or find independent exporters for you. Resume those producers after the installer succeeds so every writer uses the new lock protocol. Do not delete or rename the `.lock` sidecar during normal installation, restart, or uninstall; keeping one inode prevents concurrent processes from splitting across different locks.
+
 ```sh
 ./install.sh
 ```
 
-The installer builds the Go binary, syncs Langfuse model pricing from the configured project, installs the user service, reloads systemd, enables the service, and restarts it. It is the only required service-start step. Langfuse must already be reachable at `LANGFUSE_HOST`, and the project key pair in `~/.codex/config.toml` must already authenticate to that Langfuse instance. If model pricing sync fails, the installer stops before installing the `codex-langfuse-watch.service` unit.
+The installer builds into a temporary directory beside the installed binary and syncs Langfuse model pricing with that staged binary before changing the installed executable or stopping the watcher. If systemd reports an existing watcher, it stops and waits for it before atomically promoting the staged binary; then it installs the unit, reloads systemd, enables the service, and restarts it. A pricing or stop failure leaves the old executable in place. A failure during promotion reports the service's current state and directs you to rerun the installer. The installer is the only required service-start step. Langfuse must already be reachable at `LANGFUSE_HOST`, and the project key pair in `~/.codex/config.toml` must already authenticate to that Langfuse instance.
 
 Useful preflight checks after setting equivalent shell variables:
 
@@ -155,9 +159,10 @@ Installed files:
 ~/.codex/bin/codex-langfuse-exporter
 ~/.config/systemd/user/codex-langfuse-watch.service
 ~/.codex/langfuse-export-state.json
+~/.codex/langfuse-export-state.json.lock
 ```
 
-The version 3 state file records processed trace IDs, score retries, and queued hook requests so normal watcher runs do not resend successful observation batches. The installer starts the watcher, which creates fresh version 3 state when no state file exists; recently modified session files can then be exported again.
+The version 3 state file records processed trace IDs, score retries, and queued hook requests so normal watcher runs do not resend successful observation batches. The watcher creates initial state only when the file is absent; otherwise it preserves valid state. The lock sidecar is a persistent, empty advisory-lock file and is not evidence of a stale lock. A fresh install with no state starts at the configured initial lookback watermark; a lock-only upgrade retains the existing watermark and checkpoints.
 
 If you want the user service to run even when you are logged out, enable lingering for your Linux user:
 
@@ -182,7 +187,7 @@ Run the built-in diagnostics:
 Run a tiny Codex turn:
 
 ```sh
-codex exec --model gpt-5.4-mini -c model_reasoning_effort=low --sandbox read-only --skip-git-repo-check "Reply exactly: langfuse-smoke-test"
+codex exec -c model_reasoning_effort=low --sandbox read-only --skip-git-repo-check "Reply exactly: langfuse-smoke-test"
 ```
 
 Open Langfuse, go to Tracing, and search for `langfuse-smoke-test` or `codex.turn.transcript`.
@@ -193,7 +198,9 @@ Expected trace shape:
 - main generation: `codex.transcript`
 - tool calls: `codex.tool.*`
 
-Claude Code support can be checked with an explicit sanitized transcript path:
+Manual Claude export is an explicit send. It does not read the watcher queue or processed state and can repeat a trace the hook already queued. Do not manually export the transcript used by an automatic hook check. For manual validation, use a different session with no queued automatic export. If you cannot establish that separation, skip the manual live check.
+
+Claude Code manual export uses an explicit transcript path:
 
 ```sh
 ~/.codex/bin/codex-langfuse-exporter --provider claude --path <transcript.jsonl>
@@ -246,6 +253,8 @@ The version 3 state document uses `processed_trace_ids`, `pending_scores[trace_i
 Delivery is at-least-once to the currently configured Langfuse target. Known OTLP and score failures do not advance their checkpoints and retry on a later scan. A timeout after remote acceptance, or process termination between remote acceptance and local checkpoint persistence, can produce a duplicate on retry. The exporter does not query Langfuse to reconcile ambiguous acknowledgements and does not synchronize targets.
 
 During catch-up after an outage, the watcher waits one configured poll interval between turn export attempts so the Langfuse ingestion and score queues receive bounded load.
+
+When `span_export_succeeded ... checkpoint=pending` appears, the export callback returned successfully and the watcher has not yet recorded its pending-score checkpoint. The existing `exported` line appears only after that checkpoint operation succeeds. If `span_checkpoint_unconfirmed` appears, the checkpoint operation returned an error after a successful export callback, so a later retry may repeat the send. These lines distinguish local steps; they do not prove complete or lasting remote visibility. They contain trace IDs, status, and fixed labels only.
 
 The service is independent of the shell and Codex launch path. It covers `codex`, `co`, `codex exec`, and `codex resume` as long as Codex writes rollout files under `~/.codex/sessions/`.
 
@@ -340,7 +349,7 @@ Cost tracking uses Langfuse's model and usage handling. The exporter sends `lang
 
 Langfuse calculates cost. The built-in pricing sync creates source-backed model definitions for supported Codex/OpenAI models and current Claude models: Opus 4.7, Sonnet 4.6, and Haiku 4.5. Claude Code subscription billing is separate from Anthropic API token pricing; these definitions are for Langfuse trace cost columns when Claude records compatible model and usage details.
 
-`install.sh` runs `~/.codex/bin/codex-langfuse-exporter --sync-model-pricing --quiet` before restarting `codex-langfuse-watch.service`. The same setup can be run directly:
+`install.sh` runs its staged exporter with `--sync-model-pricing --quiet` before replacing the installed executable and restarting `codex-langfuse-watch.service`. The same setup can be run directly:
 
 ```sh
 ~/.codex/bin/codex-langfuse-exporter --sync-model-pricing
@@ -350,11 +359,7 @@ The built-in pricing catalog is source-dated from https://openai.com/api/pricing
 
 When provider pricing changes or a supported coding agent emits a new model name, update `internal/langfuse/models.go` and its catalog tests in the same change. Do not add fallback local cost multiplication.
 
-Langfuse calculates cost during ingestion. Existing rows are not backfilled automatically; use an explicit re-export for old sessions after model pricing is synced:
-
-```sh
-~/.codex/bin/codex-langfuse-exporter --session-id <session-id> --no-verify
-```
+Langfuse calculates cost during ingestion. Changing model pricing does not make this exporter update observations that were already sent. Do not re-export an old turn to backfill its cost; Langfuse observations are immutable and another send can create duplicate rows. Historical corrections need a separately reviewed, Langfuse-supported procedure.
 
 `<provider>.tool.command` metadata includes:
 
@@ -388,7 +393,7 @@ The exporter also creates deterministic trace-level Langfuse scores after each s
 - `changed_file_count`
 - `outcome`
 
-These scores are idempotent on re-export and use only parsed trace metadata. They do not make extra LLM calls. The eight score events are submitted in one Langfuse ingestion batch; trace export continues to use only the OTLP trace endpoint.
+These scores use deterministic IDs and parsed trace metadata. Their current event timestamp is assigned when the score batch is sent, so a resend on another UTC date may create another score instead of overwriting the first. Do not use manual re-export as a score repair mechanism. The scores do not make extra LLM calls. The eight score events are submitted in one Langfuse ingestion batch; trace export continues to use only the OTLP trace endpoint.
 
 ## Filtering
 
@@ -419,11 +424,21 @@ Observation filters use observation metadata:
 - `Observations: file changes`: `Name equals codex.tool.file_change`
 - `Observations: web search`: `Name equals codex.tool.web_search`
 
-After `install.sh` restarts `codex-langfuse-watch.service`, future watcher exports include these tags and MCP metadata automatically. Existing Langfuse rows are not automatically backfilled; use an explicit re-export command when old rows need the new fields.
+After `install.sh` restarts `codex-langfuse-watch.service`, future watcher exports include these tags and MCP metadata automatically. Existing Langfuse observations are not updated by this exporter. Do not resend an old turn to add tags or MCP metadata; another send can create duplicate rows. Historical corrections need a separately reviewed, Langfuse-supported procedure.
 
 ## Manual Export
 
-The watcher is the normal production path. Manual export is for explicit backfill or debugging.
+The watcher is the normal production path. Manual export does not read or update watcher state and does not check whether the trace was already sent. A manual send and a queued watcher send can both export the same turn.
+
+`--latest`, `--session-id`, and `--path` select a source. Unless `--turn-id` is supplied, the command exports every completed exportable turn in that source. It does not select only missing or unprocessed turns. Repeating an export can create duplicate observations.
+
+To restrict an intentional send to one turn in a known session:
+
+```sh
+~/.codex/bin/codex-langfuse-exporter --session-id <SESSION_ID> --turn-id <TURN_ID>
+```
+
+`--turn-id` restricts the local input only. It does not query Langfuse, deduplicate, or mark the watcher state. A turn that looks missing may still be waiting in the watcher queue or be discovered by the watcher. Before a manual send, establish that no automatic path is scheduled to send that turn. Do not edit watcher state to force an export.
 
 Export the latest local Codex session:
 
@@ -443,17 +458,7 @@ Export a specific rollout file:
 ~/.codex/bin/codex-langfuse-exporter --path ~/.codex/sessions/YYYY/MM/DD/rollout-....jsonl
 ```
 
-Explicit re-export for backfill uses the same command shape:
-
-```sh
-~/.codex/bin/codex-langfuse-exporter --path <rollout.jsonl> --no-verify
-```
-
-Skip post-export verification:
-
-```sh
-~/.codex/bin/codex-langfuse-exporter --latest --no-verify
-```
+`--no-verify` only skips the post-export check. It does not check for an existing trace or prevent duplicate writes.
 
 Manual exports print a trace URL when the Langfuse project can be resolved:
 
@@ -556,11 +561,13 @@ Common failure modes:
 - Codex reports that the `langfuse` MCP server closed during `initialize`: `langfuse-mcp==0.10.0` still uses the MCP Python SDK v1 API, so launch it with the tested `mcp>=1.28,<2` constraint shown in `examples/codex-config.toml`. An unconstrained `uvx langfuse-mcp` can resolve the incompatible MCP SDK v2.
 - `./install.sh` fails with `connect: connection refused`: Langfuse is not running at `LANGFUSE_HOST`, or the host URL points at the wrong machine or port.
 - `./install.sh` fails with `Langfuse model list /api/public/models failed with HTTP 401`: the configured public/secret key pair is not valid for the Langfuse instance at `LANGFUSE_HOST`. Seed the same `LANGFUSE_INIT_PROJECT_PUBLIC_KEY` and `LANGFUSE_INIT_PROJECT_SECRET_KEY` before first startup, or create/copy a project key pair from the Langfuse UI and update `~/.codex/config.toml`.
+- The journal shows `ERROR: export state lock busy path=... waited=2s retry_in=...`: the watcher is waiting for a state transaction and retries that same checkpoint in place. It logs at most once per minute while the lock remains busy. Check for another exporter using the same state path and inspect fresh logs for a recovery message; do not delete the sidecar to clear contention. `--doctor` may continue to show the recent error during its existing 15-minute journal window after recovery.
+- `--claude-hook` exits nonzero with an export state lock error: the request was not acknowledged or queued. Once contention clears, retry the existing hook invocation or explicitly export its transcript with `~/.codex/bin/codex-langfuse-exporter --provider claude --path <transcript.jsonl>`.
 - `systemctl --user status codex-langfuse-watch.service` says the unit is not found after `./install.sh`: the installer likely failed before the service install step. Fix the Langfuse reachability or authentication error and rerun `./install.sh`.
 - Browser sign-in redirects to `localhost`: the Langfuse server's `NEXTAUTH_URL` is still set to `http://localhost:3000`. Set it to the actual browser URL, such as a Tailscale URL, and recreate the `langfuse-web` container.
 - A browser on Windows cannot reach a Tailscale IP that works from WSL: Tailscale may be running only inside WSL. Run Tailscale on the Windows host too, or open the browser inside the same WSL network environment.
 - Native Codex OTEL still enabled, causing noisy duplicate traces.
-- Claude Code transcript exists but no trace appears because the `Stop` hook is not installed in Claude settings. Use `~/.codex/bin/codex-langfuse-exporter --provider claude --path <transcript.jsonl>` for explicit backfill, or add the documented `--claude-hook --quiet` command to Claude's `Stop` hook for future automatic exports.
+- Claude Code transcript exists but no trace appears because the `Stop` hook is not installed in Claude settings. Add the documented `--claude-hook --quiet` command to Claude's `Stop` hook for future automatic exports. The explicit `--provider claude --path <transcript.jsonl>` mode sends the transcript again if used; first confirm its trace is missing.
 - Watch state already marked a historical turn as processed.
 - Langfuse ingestion delay. Wait a few seconds and refresh the UI.
 - Empty Input/Output on unrelated observations. Select `codex.transcript`.
@@ -629,6 +636,8 @@ Do not add provider wrapper execution, a second fixture manifest, a second Langf
 ```sh
 ./uninstall.sh
 ```
+
+Uninstall removes the state JSON but leaves the empty `.lock` sidecar. Leaving it in place preserves the lock inode for any process already using the state path; there is no routine sidecar cleanup step.
 
 If Langfuse MCP was added only for this setup, remove the optional `[mcp_servers.langfuse]` block from `~/.codex/config.toml`.
 
