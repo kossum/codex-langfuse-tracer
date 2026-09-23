@@ -1,6 +1,7 @@
 package exportstate
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -37,6 +38,13 @@ func Load(path string) (*State, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read export state %s: %w", path, err)
 	}
+	// Tolerate corrupt/truncated state files (e.g. all-NUL from an interrupted
+	// write during container stop, or a zero-byte file). Instead of treating
+	// them as fatal decode errors, treat them as "no state" so the caller
+	// can start from a fresh state rather than exiting.
+	if isCorruptState(raw) {
+		return nil, nil
+	}
 	var state State
 	if err := json.Unmarshal(raw, &state); err != nil {
 		return nil, fmt.Errorf("decode export state %s: %w", path, err)
@@ -46,6 +54,29 @@ func Load(path string) (*State, error) {
 	}
 	state.normalize()
 	return &state, nil
+}
+
+// isCorruptState reports whether raw looks like a corrupted state file that
+// should be treated as absent rather than a hard error. Currently: empty,
+// whitespace-only, or all-NUL (from an interrupted O_TRUNC+write sequence
+// during a container stop).
+func isCorruptState(raw []byte) bool {
+	if len(raw) == 0 {
+		return true
+	}
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return true
+	}
+	// All-NUL: every byte is zero (classic interrupted-write artifact).
+	allNUL := true
+	for _, b := range raw {
+		if b != 0 {
+			allNUL = false
+			break
+		}
+	}
+	return allNUL
 }
 
 func saveLocked(path string, state State) error {
